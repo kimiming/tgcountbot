@@ -50,6 +50,8 @@ def create_telegram_client(session_path: str) -> TelegramClient:
 running_clients = {}
 # 正在启动中的 session，防止重复 /activate 并发打开同一 .session 文件
 _starting_sessions: set[str] = set()
+# 正在执行退出删除的 session，避免 run_tg_listener 重复 disconnect
+_logout_sessions: set[str] = set()
 _session_lifecycle_lock = threading.Lock()
 # 全局字典：用于临时存储手机号验证码登录流中的中间连接数据
 login_cache = {}
@@ -104,6 +106,17 @@ def schedule_on_tg_loop(coro):
 async def run_on_tg_loop(coro):
     """在 Web 请求中等待 Telethon 线程执行结果"""
     return await asyncio.wrap_future(schedule_on_tg_loop(coro))
+
+
+async def safe_disconnect_client(client: TelegramClient | None) -> None:
+    """安全断开 Telethon，避免重复 disconnect 导致 session 库已关闭报错"""
+    if client is None:
+        return
+    try:
+        if client.is_connected():
+            await asyncio.wait_for(client.disconnect(), timeout=8.0)
+    except (asyncio.TimeoutError, sqlite3.ProgrammingError, Exception):
+        pass
 
 
 def init_db():
@@ -398,7 +411,7 @@ async def run_tg_listener(session_path, session_name):
         await client.connect()
         if not await client.is_user_authorized():
             print(f"❌ 警告：Session [{session_name}] 离线或授权已失效，跳过。")
-            await client.disconnect()
+            await safe_disconnect_client(client)
             return
 
         with _session_lifecycle_lock:
@@ -414,10 +427,8 @@ async def run_tg_listener(session_path, session_name):
             _starting_sessions.discard(session_name)
             if running_clients.get(session_name) is client:
                 del running_clients[session_name]
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
+        if session_name not in _logout_sessions:
+            await safe_disconnect_client(client)
 
 async def background_keep_alive(client, session_name):
     """专门用来接管手动登录成功后的 client 实例，在后台维持死循环长连接"""
@@ -427,12 +438,11 @@ async def background_keep_alive(client, session_name):
     except Exception as e:
         print(f"🚨 账号 [{session_name}] 后台断开: {str(e)}")
     finally:
-        if session_name in running_clients: 
-            del running_clients[session_name]
-        try: 
-            await client.disconnect()
-        except: 
-            pass
+        with _session_lifecycle_lock:
+            if running_clients.get(session_name) is client:
+                del running_clients[session_name]
+        if session_name not in _logout_sessions:
+            await safe_disconnect_client(client)
         print(f"ℹ️ 账号 [{session_name}] 后台维持任务正常结束。")
 
 # ==================== 服务自动启动恢复任务 ====================
@@ -469,32 +479,34 @@ async def logout_and_remove_session(session_name: str) -> dict:
     if should_skip_matrix_session(session_name):
         raise ValueError("不能操作 Bot 类 Session")
 
+    _logout_sessions.add(session_name)
     client = None
-    with _session_lifecycle_lock:
-        client = running_clients.pop(session_name, None)
-        _starting_sessions.discard(session_name)
+    try:
+        with _session_lifecycle_lock:
+            client = running_clients.pop(session_name, None)
+            _starting_sessions.discard(session_name)
 
-    if client:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
+        # 必须先完整断开连接，再删 session 文件，否则 Telethon 保存状态时会报 closed database
+        await safe_disconnect_client(client)
+        await asyncio.sleep(0.5)
 
-    removed_files = []
-    sessions_dir = "sessions"
-    if os.path.isdir(sessions_dir):
-        for fname in os.listdir(sessions_dir):
-            if fname.startswith(f"{session_name}.session"):
-                fpath = os.path.join(sessions_dir, fname)
-                try:
-                    os.remove(fpath)
-                    removed_files.append(fname)
-                except OSError as e:
-                    print(f"⚠️ 删除文件失败 {fpath}: {e}")
+        removed_files = []
+        sessions_dir = "sessions"
+        if os.path.isdir(sessions_dir):
+            for fname in os.listdir(sessions_dir):
+                if fname.startswith(f"{session_name}.session"):
+                    fpath = os.path.join(sessions_dir, fname)
+                    try:
+                        os.remove(fpath)
+                        removed_files.append(fname)
+                    except OSError as e:
+                        print(f"⚠️ 删除文件失败 {fpath}: {e}")
 
-    deleted_rows = await asyncio.to_thread(delete_session_records, session_name)
-    print(f"🗑️ 已移除账号 [{session_name}]，删除文件 {removed_files}，清除 {deleted_rows} 条进粉记录。")
-    return {"session_name": session_name, "files": removed_files, "deleted_records": deleted_rows}
+        deleted_rows = await asyncio.to_thread(delete_session_records, session_name)
+        print(f"🗑️ 已移除账号 [{session_name}]，删除文件 {removed_files}，清除 {deleted_rows} 条进粉记录。")
+        return {"session_name": session_name, "files": removed_files, "deleted_records": deleted_rows}
+    finally:
+        _logout_sessions.discard(session_name)
 
 
 async def start_notification_bot():
@@ -581,10 +593,7 @@ async def start_notification_bot():
 
     except Exception as e:
         print(f"🚨 中央统计机器人拉起失败: {str(e)}")
-        try:
-            await notification_bot.disconnect()
-        except Exception:
-            pass
+        await safe_disconnect_client(notification_bot)
         notification_bot = None
 
 async def bootstrap_tg_services():
@@ -609,16 +618,12 @@ async def lifespan(app: FastAPI):
     async def _shutdown_clients():
         global notification_bot
         for name, client in list(running_clients.items()):
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+            await safe_disconnect_client(client)
+        running_clients.clear()
         if notification_bot is not None:
-            try:
-                await notification_bot.disconnect()
-            except Exception:
-                pass
+            await safe_disconnect_client(notification_bot)
             notification_bot = None
+        await asyncio.sleep(0.3)
 
     if _tg_loop is not None:
         try:
