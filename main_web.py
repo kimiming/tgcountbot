@@ -53,6 +53,8 @@ _starting_sessions: set[str] = set()
 # 正在执行退出删除的 session，避免 run_tg_listener 重复 disconnect
 _logout_sessions: set[str] = set()
 _session_lifecycle_lock = threading.Lock()
+# 每个 session 在 TG 事件循环上的串行锁（connect 期间不能让出并发）
+_session_async_locks: dict[str, asyncio.Lock] = {}
 # 全局字典：用于临时存储手机号验证码登录流中的中间连接数据
 login_cache = {}
 # 中央统计通知 Bot（Telethon，处理白名单与大盘查询）
@@ -117,6 +119,65 @@ async def safe_disconnect_client(client: TelegramClient | None) -> None:
             await asyncio.wait_for(client.disconnect(), timeout=8.0)
     except (asyncio.TimeoutError, sqlite3.ProgrammingError, Exception):
         pass
+
+
+def _get_session_async_lock(session_name: str) -> asyncio.Lock:
+    if session_name not in _session_async_locks:
+        _session_async_locks[session_name] = asyncio.Lock()
+    return _session_async_locks[session_name]
+
+
+def _cleanup_stale_session_aux_files(session_path: str) -> None:
+    """清理异常退出后残留的 sqlite 辅助文件（仅在即将独占打开 session 前调用）"""
+    for suffix in ("-journal", "-wal", "-shm"):
+        aux = f"{session_path}{suffix}"
+        if os.path.exists(aux):
+            try:
+                os.remove(aux)
+            except OSError:
+                pass
+
+
+async def connect_client_with_retry(client: TelegramClient, session_name: str, max_attempts: int = 6) -> None:
+    """连接 Telethon，遇 session 文件锁时自动退避重试（服务器上更常见）"""
+    last_err = None
+    for attempt in range(max_attempts):
+        try:
+            if client.is_connected():
+                return
+            await client.connect()
+            return
+        except Exception as e:
+            last_err = e
+            err = str(e).lower()
+            if ("locked" in err or "database" in err) and attempt < max_attempts - 1:
+                wait = 1.5 * (attempt + 1)
+                print(
+                    f"⏳ [{session_name}] session 文件繁忙，{wait:.1f}s 后重试 "
+                    f"({attempt + 1}/{max_attempts})..."
+                )
+                await asyncio.sleep(wait)
+                continue
+            raise
+    if last_err:
+        raise last_err
+
+
+async def release_session_holders(session_name: str) -> None:
+    """拉起/登录前释放同 session 的其它客户端占用"""
+    with _session_lifecycle_lock:
+        client = running_clients.pop(session_name, None)
+        _starting_sessions.discard(session_name)
+
+    if client:
+        await safe_disconnect_client(client)
+        await asyncio.sleep(0.8)
+
+    for key, cache in list(login_cache.items()):
+        if cache.get("session_name") == session_name:
+            await safe_disconnect_client(cache.get("client"))
+            login_cache.pop(key, None)
+            await asyncio.sleep(0.3)
 
 
 def init_db():
@@ -397,53 +458,55 @@ def start_msg_listener(client, session_name):
         events.NewMessage(incoming=True)
     )
 
-async def run_tg_listener(session_path, session_name):
-    """用于加载离线卡片或启动时批量恢复现有的受控矩阵账号文件"""
-    with _session_lifecycle_lock:
-        if session_name in running_clients or session_name in _starting_sessions:
-            print(f"⏭️ 账号 [{session_name}] 已在运行或启动中，跳过重复加载。")
-            return
-        _starting_sessions.add(session_name)
+async def run_tg_listener(session_path, session_name, existing_client: TelegramClient | None = None):
+    """加载受控 Session 并维持监听；existing_client 用于登录后复用已连接客户端"""
+    lock = _get_session_async_lock(session_name)
+    if lock.locked():
+        print(f"⏭️ 账号 [{session_name}] 已有连接任务进行中，跳过重复加载。")
+        return
 
-    print(f"🔄 后端建立网络连接，正在安全加载受控 Session: {session_name}...")
-    client = create_telegram_client(session_path)
-    try:
-        await client.connect()
-        if not await client.is_user_authorized():
-            print(f"❌ 警告：Session [{session_name}] 离线或授权已失效，跳过。")
-            await safe_disconnect_client(client)
-            return
+    async with lock:
+        with _session_lifecycle_lock:
+            if session_name in running_clients and existing_client is None:
+                print(f"⏭️ 账号 [{session_name}] 已在运行，跳过重复加载。")
+                return
+            _starting_sessions.add(session_name)
 
-        with _session_lifecycle_lock:
-            running_clients[session_name] = client
-        start_msg_listener(client, session_name)
-        me = await client.get_me()
-        print(f"🟢 矩阵受控号监听完全激活: {session_name} ([@{me.username or '无'}])")
-        await client.run_until_disconnected()
-    except Exception as e:
-        print(f"🚨 账号 [{session_name}] 后台任务发生异常退出! 原因: {str(e)}")
-    finally:
-        with _session_lifecycle_lock:
-            _starting_sessions.discard(session_name)
-            if running_clients.get(session_name) is client:
-                del running_clients[session_name]
-        if session_name not in _logout_sessions:
-            await safe_disconnect_client(client)
+        own_client = existing_client is None
+        client = existing_client or create_telegram_client(session_path)
+        print(f"🔄 后端建立网络连接，正在安全加载受控 Session: {session_name}...")
+        try:
+            if own_client:
+                await release_session_holders(session_name)
+                _cleanup_stale_session_aux_files(session_path)
+                await connect_client_with_retry(client, session_name)
 
-async def background_keep_alive(client, session_name):
-    """专门用来接管手动登录成功后的 client 实例，在后台维持死循环长连接"""
-    try:
-        print(f"🔁 账号 [{session_name}] 已成功挂载，进入常驻后台长连接监听态...")
-        await client.run_until_disconnected()
-    except Exception as e:
-        print(f"🚨 账号 [{session_name}] 后台断开: {str(e)}")
-    finally:
-        with _session_lifecycle_lock:
-            if running_clients.get(session_name) is client:
-                del running_clients[session_name]
-        if session_name not in _logout_sessions:
-            await safe_disconnect_client(client)
-        print(f"ℹ️ 账号 [{session_name}] 后台维持任务正常结束。")
+            if not await client.is_user_authorized():
+                print(f"❌ 警告：Session [{session_name}] 离线或授权已失效，跳过。")
+                if own_client:
+                    await safe_disconnect_client(client)
+                return
+
+            with _session_lifecycle_lock:
+                running_clients[session_name] = client
+            start_msg_listener(client, session_name)
+            me = await client.get_me()
+            print(f"🟢 矩阵受控号监听完全激活: {session_name} ([@{me.username or '无'}])")
+            await client.run_until_disconnected()
+        except Exception as e:
+            print(f"🚨 账号 [{session_name}] 后台任务发生异常退出! 原因: {str(e)}")
+        finally:
+            with _session_lifecycle_lock:
+                _starting_sessions.discard(session_name)
+                if running_clients.get(session_name) is client:
+                    del running_clients[session_name]
+            if session_name not in _logout_sessions:
+                await safe_disconnect_client(client)
+
+async def _staggered_load_session(file_path: str, session_name: str, delay: float) -> None:
+    if delay > 0:
+        await asyncio.sleep(delay)
+    await run_tg_listener(file_path, session_name)
 
 # ==================== 服务自动启动恢复任务 ====================
 async def auto_load_all_sessions():
@@ -469,10 +532,10 @@ async def auto_load_all_sessions():
         print("📂 未发现可加载的矩阵受控主号 session 文件。")
         return
 
-    print(f"📂 发现本地共有 {len(matrix_files)} 个受控账号文件，开始进行并发拓扑连接...")
-    for file, session_name in matrix_files:
+    print(f"📂 发现本地共有 {len(matrix_files)} 个受控账号文件，将错峰依次连接（避免 session 文件锁）...")
+    for idx, (file, session_name) in enumerate(matrix_files):
         file_path = f"sessions/{file}"
-        schedule_on_tg_loop(run_tg_listener(file_path, session_name))
+        schedule_on_tg_loop(_staggered_load_session(file_path, session_name, idx * 3.0))
 
 async def logout_and_remove_session(session_name: str) -> dict:
     """断开连接、删除 session 文件及该号全部进粉记录"""
@@ -684,21 +747,20 @@ async def _login_step1_impl(phone: str):
     file_path = f"sessions/{session_name}.session"
 
     if clean_phone in login_cache:
-        try:
-            await login_cache[clean_phone]["client"].disconnect()
-        except Exception:
-            pass
+        await safe_disconnect_client(login_cache[clean_phone]["client"])
+        login_cache.pop(clean_phone, None)
+
+    await release_session_holders(session_name)
+    _cleanup_stale_session_aux_files(file_path)
 
     print(f"📱 正在为手机号 {phone} 创建全新的网络连接客户端...")
     client = create_telegram_client(file_path)
 
     try:
-        await client.connect()
+        await connect_client_with_retry(client, session_name)
         if await client.is_user_authorized():
             print(f"ℹ️ 经检测，手机号 {phone} 本地已是在线登录状态，直接拉起。")
-            running_clients[session_name] = client
-            start_msg_listener(client, session_name)
-            schedule_on_tg_loop(background_keep_alive(client, session_name))
+            schedule_on_tg_loop(run_tg_listener(file_path, session_name, existing_client=client))
             return {"status": "already_logged_in", "msg": "该账号本地已是在线登录状态，已直接拉起监听！"}
 
         send_code_result = await client.send_code_request(phone)
@@ -709,10 +771,7 @@ async def _login_step1_impl(phone: str):
         print(f"📩 官方验证码已成功下发至手机号 {phone}。")
         return {"status": "success", "msg": "验证码下发成功！"}
     except Exception as e:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
+        await safe_disconnect_client(client)
         print(f"❌ 发码失败: {e}")
         raise
 
@@ -750,12 +809,10 @@ async def _login_step2_impl(phone: str, code: str, password: str | None):
             raise e
 
     print(f"🎉 手机号 {phone} 顺利通关，登录成功！")
-    running_clients[session_name] = client
-    start_msg_listener(client, session_name)
-    schedule_on_tg_loop(background_keep_alive(client, session_name))
-
+    file_path = cache["file_path"]
     if clean_phone in login_cache:
         del login_cache[clean_phone]
+    schedule_on_tg_loop(run_tg_listener(file_path, session_name, existing_client=client))
 
     return {"status": "success", "msg": "登录成功，已在后台无锁状态激活长监听！"}
 
@@ -774,8 +831,9 @@ async def login_step2(phone: str = Form(...), code: str = Form(...), password: s
 # 手动激活离线账号
 @app.get("/activate/{session_name}")
 async def activate_session(session_name: str):
-    if session_name in running_clients:
-        return RedirectResponse(url="/", status_code=303)
+    with _session_lifecycle_lock:
+        if session_name in running_clients or session_name in _starting_sessions:
+            return RedirectResponse(url="/", status_code=303)
     file_path = f"sessions/{session_name}.session"
     if os.path.exists(file_path):
         schedule_on_tg_loop(run_tg_listener(file_path, session_name))
