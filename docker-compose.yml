@@ -12,15 +12,15 @@ services:
       - .env
     environment:
       WEB_HOST: "0.0.0.0"
-      WEB_PORT: "8000"
+      WEB_PORT: "8006"
       DB_FILE: "/app/data/tg_cloud_stats.db"
     ports:
-      - "${WEB_PUBLISH_PORT:-8000}:8000"
+      - "${WEB_PUBLISH_PORT:-8006}:8006"
     volumes:
       - ./sessions:/app/sessions
       - ./data:/app/data
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8006/health', timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -17,6 +17,6 @@ COPY templates/ templates/
 
 RUN mkdir -p sessions data
 
-EXPOSE 8000
+EXPOSE 8006
 
 CMD ["python", "main_web.py"]

@@ -503,6 +503,6 @@ if __name__ == "__main__":
     import uvicorn
 
     web_host = os.environ.get("WEB_HOST", "0.0.0.0")
-    web_port = int(os.environ.get("WEB_PORT", "8000"))
+    web_port = int(os.environ.get("WEB_PORT", "8006"))
     print(f"🚀 正在拉起 Uvicorn Web 服务 ({web_host}:{web_port})...")
     uvicorn.run("main_web:app", host=web_host, port=web_port, reload=False)

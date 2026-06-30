@@ -57,8 +57,8 @@ echo "==> 等待健康检查..."
 sleep 5
 ${COMPOSE_CMD} -f docker-compose.yml ps
 
-PUBLISH_PORT="$(grep -E '^WEB_PUBLISH_PORT=' .env 2>/dev/null | cut -d= -f2- || echo 8000)"
-PUBLISH_PORT="${PUBLISH_PORT:-8000}"
+PUBLISH_PORT="$(grep -E '^WEB_PUBLISH_PORT=' .env 2>/dev/null | cut -d= -f2- || echo 8006)"
+PUBLISH_PORT="${PUBLISH_PORT:-8006}"
 
 echo ""
 echo "=========================================="
