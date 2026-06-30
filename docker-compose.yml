@@ -6,6 +6,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      network: host
+    dns:
+      - 114.114.114.114
+      - 8.8.8.8
     container_name: tg-stats-bot
     restart: unless-stopped
     env_file:
