@@ -1,0 +1,27 @@
+# TG 统计机器人 — Ubuntu 一键部署
+# 用法: cp .env.example .env && 编辑 .env 后执行 bash deploy/ubuntu-deploy.sh
+
+services:
+  tg-stats-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tg-stats-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      WEB_HOST: "0.0.0.0"
+      WEB_PORT: "8000"
+      DB_FILE: "/app/data/tg_cloud_stats.db"
+    ports:
+      - "${WEB_PUBLISH_PORT:-8000}:8000"
+    volumes:
+      - ./sessions:/app/sessions
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

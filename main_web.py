@@ -1,0 +1,508 @@
+import os
+import sys
+import json
+import sqlite3
+import asyncio
+import threading
+import urllib.request
+from datetime import datetime
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, Form, UploadFile, File
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
+from telethon import TelegramClient, events
+
+# Windows 下 Telethon + asyncio 更稳定的事件循环策略
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+# 自动创建用于存放 TG 账号文件的 sessions 文件夹
+os.makedirs("sessions", exist_ok=True)
+templates = Jinja2Templates(directory="templates")
+
+# Windows 下默认控制台常为 GBK，遇到 emoji 会触发 UnicodeEncodeError
+if sys.platform.startswith("win"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+# ==================== 全局 TG 配置（支持环境变量，便于服务器部署）====================
+API_ID = int(os.environ.get("TG_API_ID", "2040"))
+API_HASH = os.environ.get("TG_API_HASH", "b18441a1ff607e10a989891a5462e627")
+DB_FILE = os.environ.get("DB_FILE", "tg_cloud_stats.db")
+
+# 🤖 通知机器人核心配置 (用于向你的个人 TG 推送通知)
+BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "8748068830:AAFnHnzjcBlNQXagAyDlLabCq4o51W_aRCY")
+ADMIN_CHAT_ID = int(os.environ.get("TG_ADMIN_CHAT_ID", "5654372746"))
+
+
+def create_telegram_client(session_path: str) -> TelegramClient:
+    """直连 Telegram（服务器可正常出海时无需代理）"""
+    return TelegramClient(session_path, API_ID, API_HASH)
+
+# 全局字典：记录当前正在后台【真正运行】监听的客户端实例 {session_name: client_instance}
+running_clients = {}
+# 全局字典：用于临时存储手机号验证码登录流中的中间连接数据
+login_cache = {}
+# 专用 Telethon 后台线程事件循环，避免阻塞 Web 主循环
+_tg_loop = None
+_tg_loop_ready = threading.Event()
+
+# ==================== SQLite3 数据库操作 ====================
+def _db_connect():
+    return sqlite3.connect(DB_FILE, timeout=30)
+
+
+def should_skip_matrix_session(session_name: str) -> bool:
+    """sessions/ 目录里只放矩阵受控主号，跳过 Bot/通知类 session 避免文件锁冲突"""
+    lowered = session_name.lower()
+    return "bot" in lowered or "notification" in lowered
+
+
+def _start_tg_event_loop():
+    """在独立守护线程中运行 Telethon 专用事件循环"""
+    global _tg_loop
+
+    def _runner():
+        global _tg_loop
+        _tg_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_tg_loop)
+        _tg_loop_ready.set()
+        _tg_loop.run_forever()
+
+    threading.Thread(target=_runner, name="tg-event-loop", daemon=True).start()
+    if not _tg_loop_ready.wait(timeout=10):
+        raise RuntimeError("Telethon 后台事件循环启动超时")
+
+
+def ensure_tg_loop():
+    if _tg_loop is None:
+        _start_tg_event_loop()
+    return _tg_loop
+
+
+def schedule_on_tg_loop(coro):
+    """把协程投递到 Telethon 专用线程执行"""
+    loop = ensure_tg_loop()
+    return asyncio.run_coroutine_threadsafe(coro, loop)
+
+
+async def run_on_tg_loop(coro):
+    """在 Web 请求中等待 Telethon 线程执行结果"""
+    return await asyncio.wrap_future(schedule_on_tg_loop(coro))
+
+
+def init_db():
+    """初始化 SQLite3 数据库表结构"""
+    conn = _db_connect()
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS strangers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_name TEXT,
+            user_id INTEGER,
+            username TEXT,
+            full_name TEXT,
+            created_at TEXT,
+            UNIQUE(session_name, user_id)
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    print("🗄️ SQLite3 数据库初始化/检查完成。")
+
+def get_stats():
+    """从数据库获取前端大盘需要渲染的所有历史数据"""
+    conn = _db_connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT session_name, user_id, username, full_name, created_at FROM strangers ORDER BY id DESC")
+    rows = cursor.fetchall()
+    cursor.execute("SELECT session_name, COUNT(*) FROM strangers GROUP BY session_name")
+    counts = dict(cursor.fetchall())
+    conn.close()
+    
+    logs = []
+    for r in rows:
+        logs.append({
+            "session": r[0], "user_id": r[1], "username": r[2],
+            "full_name": r[3], "created_at": r[4]
+        })
+    return logs, counts
+
+def save_stranger(session_name, user_id, username, full_name):
+    """尝试将捕获到的陌生人写入数据库，重复消息自动清洗去重"""
+    conn = _db_connect()
+    cursor = conn.cursor()
+    try:
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        cursor.execute(
+            "INSERT INTO strangers (session_name, user_id, username, full_name, created_at) VALUES (?, ?, ?, ?, ?)",
+            (session_name, user_id, username, full_name, now)
+        )
+        conn.commit()
+        return True 
+    except sqlite3.IntegrityError:
+        return False 
+    finally:
+        conn.close()
+
+# ==================== TG 机器人推送逻辑 ====================
+def _send_bot_message_sync(text: str) -> bool:
+    """通过 Telegram Bot HTTP API 直连推送，不占用 Telethon 会话文件"""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = json.dumps(
+        {"chat_id": ADMIN_CHAT_ID, "text": text, "parse_mode": "HTML"},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return resp.status == 200
+
+
+async def push_notification(session_name, full_name, user_id, username):
+    """异步调用通知机器人向管理员实时推送进粉名片数据"""
+    text = (
+        f"🎯 <b>系统实时进粉通知</b>\n\n"
+        f"<b>📁 进粉受控主号：</b> <code>{session_name}</code>\n"
+        f"<b>👤 粉丝昵称：</b> {full_name}\n"
+        f"<b>🆔 粉丝唯一ID：</b> <code>{user_id}</code>\n"
+        f"<b>🔗 跳转链接：</b> {username}\n"
+        f"<b>⏰ 捕获时间：</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    try:
+        ok = await asyncio.to_thread(_send_bot_message_sync, text)
+        if ok:
+            print(f"🚀 [Bot] 已向管理员成功推送 [{session_name}] 的进粉通知数据。")
+        else:
+            print(f"⚠️ [Bot] 推送失败：Telegram API 返回非 200 状态。")
+    except Exception as e:
+        print(f"🚨 [Bot] 推送通知发生异常: {str(e)}")
+
+# ==================== TG 矩阵监听机制 ====================
+async def stranger_msg_handler(event, session_name):
+    """
+    【受控号专属拦截器】
+    只允许 sessions/ 目录下的受控矩阵主号触发。不参与记录具体的聊天文本内容。
+    只抓取是谁发来的（名字/ID/链接），并利用 SQLite 物理去重，实现精准进粉计数。
+    """
+    # 🛑 铁律 1：如果传入的 session 名字包含机器人标识，坚决拒绝入库，防止张冠李戴
+    if "bot" in session_name.lower():
+        return
+
+    if not event.is_private: 
+        return  # 🛑 铁律 2：过滤掉所有群组消息，只监控私聊主动进粉
+        
+    try:
+        sender = await event.get_sender()
+        if not sender:
+            sender = await event.client.get_entity(event.peer_id)
+            
+        if not sender or sender.is_self or sender.bot:
+            return  # 排除自己发的以及任何其它官方/业务机器人
+
+        # 提取粉丝基础身份信息（具体发了什么内容 event.raw_text 在这里直接被无视，保护隐私不留存）
+        username = f"@{sender.username}" if sender.username else "未设置用户名"
+        full_name = f"{sender.first_name or ''} {sender.last_name or ''}".strip()
+        
+        # 打印原始拦截心跳（控制台可见，用来证明链路是活的）
+        print(f"🔔 矩阵受控号 [{session_name}] 侦测到陌生人 [{full_name}] 传来私聊信号。")
+
+        # 直接尝试写入 SQLite 数据库（UNIQUE 索引会自动判断该粉丝是否是该受控号的新粉丝）
+        if await asyncio.to_thread(save_stranger, session_name, sender.id, username, full_name):
+            # 进粉成功！
+            print(f"🎯 [新粉入网] 矩阵号 [{session_name}] 成功在 SQLite 记录全新新进粉丝: {full_name} ({username})，已计入大盘！")
+            
+            # 让中央统计机器人去干它的本职工作：推送统计名片
+            schedule_on_tg_loop(push_notification(session_name, full_name, sender.id, username))
+        else:
+            # 如果之前已经记录过这个人，说明他只是在继续聊天，不重复计算进粉数
+            print(f"ℹ️ [日常互动] 矩阵号 [{session_name}] 粉丝 {full_name} 属于老客日常互动，不重复累加计数。")
+                
+    except Exception as e:
+        print(f"🚨 消息拦截器局部异常: {str(e)}")
+
+def start_msg_listener(client, session_name):
+    """强行将消息接收事件挂载到 Telethon 核心事件队列中"""
+    print(f"📡 正在为矩阵主号 [{session_name}] 强行注入事件拦截网...")
+    
+    # 通过显式传入默认参数(s_name=session_name)，锁死多账号并发下的异步上下文作用域，防止串号
+    client.add_event_handler(
+        lambda event, s_name=session_name: stranger_msg_handler(event, s_name), 
+        events.NewMessage(incoming=True)
+    )
+
+async def run_tg_listener(session_path, session_name):
+    """用于加载离线卡片或启动时批量恢复现有的受控矩阵账号文件"""
+    if session_name in running_clients:
+        return
+    print(f"🔄 后端建立网络连接，正在安全加载受控 Session: {session_name}...")
+    client = create_telegram_client(session_path)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            print(f"❌ 警告：Session [{session_name}] 离线或授权已失效，跳过。")
+            await client.disconnect()
+            return
+            
+        running_clients[session_name] = client
+        start_msg_listener(client, session_name)
+        me = await client.get_me()
+        print(f"🟢 矩阵受控号监听完全激活: {session_name} ([@{me.username or '无'}])")
+        await client.run_until_disconnected()
+    except Exception as e:
+        print(f"🚨 账号 [{session_name}] 后台任务发生异常退出! 原因: {str(e)}")
+    finally:
+        if session_name in running_clients: 
+            del running_clients[session_name]
+        try: 
+            await client.disconnect()
+        except: 
+            pass
+
+async def background_keep_alive(client, session_name):
+    """专门用来接管手动登录成功后的 client 实例，在后台维持死循环长连接"""
+    try:
+        print(f"🔁 账号 [{session_name}] 已成功挂载，进入常驻后台长连接监听态...")
+        await client.run_until_disconnected()
+    except Exception as e:
+        print(f"🚨 账号 [{session_name}] 后台断开: {str(e)}")
+    finally:
+        if session_name in running_clients: 
+            del running_clients[session_name]
+        try: 
+            await client.disconnect()
+        except: 
+            pass
+        print(f"ℹ️ 账号 [{session_name}] 后台维持任务正常结束。")
+
+# ==================== 服务自动启动恢复任务 ====================
+async def auto_load_all_sessions():
+    """机器人自动批量拉起：扫描本地现有 sessions 并批量恢复监控"""
+    print("🤖 启动全自动批量监控任务，正在检索本地受控主号 session 矩阵...")
+    if not os.path.exists("sessions"):
+        return
+    
+    files = [f for f in os.listdir("sessions") if f.endswith(".session")]
+    if not files:
+        print("📂 暂未发现本地缓存的受控主号 session 文件，等待管理员后续手动添加。")
+        return
+        
+    matrix_files = []
+    for file in files:
+        session_name = file.replace(".session", "")
+        if should_skip_matrix_session(session_name):
+            print(f"⏭️ 跳过非矩阵受控号 Session: {session_name}")
+            continue
+        matrix_files.append((file, session_name))
+
+    if not matrix_files:
+        print("📂 未发现可加载的矩阵受控主号 session 文件。")
+        return
+
+    print(f"📂 发现本地共有 {len(matrix_files)} 个受控账号文件，开始进行并发拓扑连接...")
+    for file, session_name in matrix_files:
+        file_path = f"sessions/{file}"
+        schedule_on_tg_loop(run_tg_listener(file_path, session_name))
+
+async def start_notification_bot():
+    """保留占位：通知已改为 HTTP Bot API，不再启动 Telethon 通知客户端"""
+    print("🤖 通知通道使用 Telegram Bot HTTP API（无需额外 Session 文件）。")
+
+async def bootstrap_tg_services():
+    """后台拉起 TG 服务，避免阻塞 Web 页面首次响应"""
+    ensure_tg_loop()
+    await asyncio.sleep(0.5)
+    await start_notification_bot()
+    await auto_load_all_sessions()
+
+
+# ==================== FastAPI 生命周期初始化 ====================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. 数据库初始化（放线程池，避免阻塞事件循环）
+    await asyncio.to_thread(init_db)
+    # 2/3. TG 监听与通知机器人在后台异步拉起，Web 页面可立即访问
+    asyncio.create_task(bootstrap_tg_services())
+    yield
+    # 服务关闭时安全断开所有长连接
+    print("🛑 正在关闭 Web 服务，正在释放所有 TG 后台长连接...")
+
+    async def _shutdown_clients():
+        for name, client in list(running_clients.items()):
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+    if _tg_loop is not None:
+        try:
+            fut = schedule_on_tg_loop(_shutdown_clients())
+            fut.result(timeout=10)
+            _tg_loop.call_soon_threadsafe(_tg_loop.stop)
+        except Exception:
+            pass
+    print("🛑 所有后台长连接已安全切断。")
+
+app = FastAPI(lifespan=lifespan)
+
+# ==================== Web 路由接口 ====================
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    logs, counts = await asyncio.to_thread(get_stats)
+    existing_sessions = await asyncio.to_thread(
+        lambda: [
+            f.replace(".session", "")
+            for f in os.listdir("sessions")
+            if f.endswith(".session") and not should_skip_matrix_session(f.replace(".session", ""))
+        ]
+    )
+    active_sessions = list(running_clients.keys())
+
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {
+            "logs": logs,
+            "counts": counts,
+            "existing_sessions": existing_sessions,
+            "active_sessions": active_sessions,
+        },
+    )
+
+@app.post("/upload_session")
+async def upload_session(file: UploadFile = File(...)):
+    if not file.filename.endswith(".session"):
+        return JSONResponse(status_code=400, content={"error": "请上传标准的 .session 后缀文件"})
+    
+    session_name = file.filename.replace(".session", "")
+    file_path = f"sessions/{file.filename}"
+    with open(file_path, "wb") as buffer:
+        buffer.write(await file.read())
+
+    schedule_on_tg_loop(run_tg_listener(file_path, session_name))
+    return RedirectResponse(url="/", status_code=303)
+
+# ----【AJAX 第一步：发送验证码】----
+async def _login_step1_impl(phone: str):
+    clean_phone = phone.replace('+', '').replace(' ', '').strip()
+    session_name = f"manual_{clean_phone}"
+    file_path = f"sessions/{session_name}.session"
+
+    if clean_phone in login_cache:
+        try:
+            await login_cache[clean_phone]["client"].disconnect()
+        except Exception:
+            pass
+
+    print(f"📱 正在为手机号 {phone} 创建全新的网络连接客户端...")
+    client = create_telegram_client(file_path)
+
+    try:
+        await client.connect()
+        if await client.is_user_authorized():
+            print(f"ℹ️ 经检测，手机号 {phone} 本地已是在线登录状态，直接拉起。")
+            running_clients[session_name] = client
+            start_msg_listener(client, session_name)
+            schedule_on_tg_loop(background_keep_alive(client, session_name))
+            return {"status": "already_logged_in", "msg": "该账号本地已是在线登录状态，已直接拉起监听！"}
+
+        send_code_result = await client.send_code_request(phone)
+        login_cache[clean_phone] = {
+            "client": client, "phone_code_hash": send_code_result.phone_code_hash,
+            "phone": phone, "session_name": session_name, "file_path": file_path
+        }
+        print(f"📩 官方验证码已成功下发至手机号 {phone}。")
+        return {"status": "success", "msg": "验证码下发成功！"}
+    except Exception as e:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        print(f"❌ 发码失败: {e}")
+        raise
+
+
+@app.post("/login_step1")
+async def login_step1(phone: str = Form(...)):
+    try:
+        result = await run_on_tg_loop(_login_step1_impl(phone))
+        return JSONResponse(content=result)
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+
+async def _login_step2_impl(phone: str, code: str, password: str | None):
+    clean_phone = phone.replace('+', '').replace(' ', '').strip()
+
+    if clean_phone not in login_cache:
+        raise ValueError("未找到对应的暂存通道链路，请重新尝试第一步发码。")
+
+    cache = login_cache[clean_phone]
+    client = cache["client"]
+    session_name = cache["session_name"]
+
+    print(f"🔑 正在向 TG 官方提交 5 位验证码 [{code}] 进行安全鉴权...")
+    try:
+        await client.sign_in(phone=cache["phone"], code=code, phone_code_hash=cache["phone_code_hash"])
+    except Exception as e:
+        if "password" in str(e).lower() or "protected" in str(e).lower() or "two-step" in str(e).lower():
+            if password:
+                print("🔐 侦测到两步验证保护！正在二次提交独立密码进行验证登录...")
+                await client.sign_in(password=password)
+            else:
+                return {"error": "NEED_PASSWORD", "status_code": 400}
+        else:
+            raise e
+
+    print(f"🎉 手机号 {phone} 顺利通关，登录成功！")
+    running_clients[session_name] = client
+    start_msg_listener(client, session_name)
+    schedule_on_tg_loop(background_keep_alive(client, session_name))
+
+    if clean_phone in login_cache:
+        del login_cache[clean_phone]
+
+    return {"status": "success", "msg": "登录成功，已在后台无锁状态激活长监听！"}
+
+
+@app.post("/login_step2")
+async def login_step2(phone: str = Form(...), code: str = Form(...), password: str = Form(None)):
+    try:
+        result = await run_on_tg_loop(_login_step2_impl(phone, code, password))
+        if result.get("error") == "NEED_PASSWORD":
+            return JSONResponse(status_code=400, content={"error": "NEED_PASSWORD"})
+        return JSONResponse(content=result)
+    except Exception as e:
+        print(f"❌ 验证码或两步验证密码校验失败: {e}")
+        return JSONResponse(status_code=400, content={"error": f"安全校验失败，登录终止: {str(e)}"})
+
+# 手动激活离线账号
+@app.get("/activate/{session_name}")
+async def activate_session(session_name: str):
+    file_path = f"sessions/{session_name}.session"
+    if os.path.exists(file_path):
+        schedule_on_tg_loop(run_tg_listener(file_path, session_name))
+    return RedirectResponse(url="/", status_code=303)
+
+if __name__ == "__main__":
+    import uvicorn
+
+    web_host = os.environ.get("WEB_HOST", "0.0.0.0")
+    web_port = int(os.environ.get("WEB_PORT", "8000"))
+    print(f"🚀 正在拉起 Uvicorn Web 服务 ({web_host}:{web_port})...")
+    uvicorn.run("main_web:app", host=web_host, port=web_port, reload=False)

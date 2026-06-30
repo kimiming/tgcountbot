@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>TG 分布式云控进粉监控统计大盘</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <style>
+      /* CDN 不可用时提供基础可读样式，避免白屏难用 */
+      body { margin: 0; font-family: system-ui, sans-serif; }
+      .max-w-7xl { max-width: 80rem; margin: 0 auto; }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { padding: 0.75rem 1rem; border-bottom: 1px solid #e5e7eb; }
+    </style>
+  </head>
+  <body class="bg-gray-100 font-sans p-8">
+    <div class="max-w-7xl mx-auto">
+      <h1 class="text-3xl font-bold text-gray-800 mb-8 text-center">
+        📊 TG 自动化分布式云控系统大盘
+      </h1>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
+        <div
+          class="bg-white p-6 rounded-lg shadow-md flex flex-col justify-between"
+        >
+          <div>
+            <h2 class="text-xl font-semibold text-gray-700 mb-2">
+              📥 方案 A：上传现有 Session 监控
+            </h2>
+            <p class="text-xs text-gray-500 mb-4">
+              适合批量从外包或第三方软件中导出的标准 .session 会话文件。
+            </p>
+          </div>
+          <form
+            action="/upload_session"
+            method="post"
+            enctype="multipart/form-data"
+            class="space-y-4"
+          >
+            <input
+              type="file"
+              name="file"
+              accept=".session"
+              class="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
+              required
+            />
+            <button
+              type="submit"
+              class="w-full bg-blue-600 text-white py-2 rounded-lg font-medium hover:bg-blue-700 transition"
+            >
+              上传并拉起后台监听
+            </button>
+          </form>
+        </div>
+
+        <div class="bg-white p-6 rounded-lg shadow-md">
+          <h2 class="text-xl font-semibold text-gray-700 mb-2">
+            📱 方案 B Black：手动手机号全异步无跳转登录
+          </h2>
+
+          <div class="space-y-2">
+            <label class="text-xs font-bold text-gray-600 block"
+              >Step 1：获取官方验证码</label
+            >
+            <div class="flex gap-2">
+              <input
+                type="text"
+                id="phone_input"
+                placeholder="输入手机号 (如 +8615017817095)"
+                class="flex-1 px-4 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
+                required
+              />
+              <button
+                type="button"
+                id="send_code_btn"
+                onclick="sendSmsCode()"
+                class="bg-green-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-green-700 transition flex items-center justify-center min-w-[100px]"
+              >
+                <span id="btn_text_1">发送验证码</span>
+              </button>
+            </div>
+            <p id="sms_tip_1" class="text-xs mt-1 hidden"></p>
+          </div>
+
+          <div class="space-y-3 mt-4 border-t pt-4">
+            <label class="text-xs font-bold text-gray-600 block"
+              >Step 2：输入接收到的账据信息进行登录</label
+            >
+            <input
+              type="text"
+              id="confirm_phone"
+              placeholder="再次确认填写的手机号 (如 +8615017817095)"
+              class="w-full px-4 py-2 border rounded-lg text-sm focus:outline-none"
+              required
+            />
+            <input
+              type="text"
+              id="login_code"
+              placeholder="输入 TG 官方下发的 5 位数字验证码"
+              class="w-full px-4 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
+              required
+            />
+            <input
+              type="password"
+              id="login_password"
+              placeholder="两步验证密码 (没有请留空)"
+              class="w-full px-4 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
+            />
+
+            <button
+              type="button"
+              id="submit_login_btn"
+              onclick="submitLoginInfo()"
+              class="w-full bg-gray-800 text-white py-2 rounded-lg text-sm font-medium hover:bg-black transition flex items-center justify-center"
+            >
+              <span id="btn_text_2">确认提交并激活常驻监听</span>
+            </button>
+            <p id="sms_tip_2" class="text-xs mt-1 hidden"></p>
+          </div>
+        </div>
+      </div>
+
+      <div class="bg-white p-6 rounded-lg shadow-md mb-8">
+        <h2 class="text-xl font-semibold text-gray-700 mb-4">
+          🟢 矩阵账号受控状态一览
+        </h2>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+          {% if not existing_sessions %}
+          <p class="text-sm text-gray-400 col-span-4 py-4 text-center">
+            📂 暂无任何受控 Session...
+          </p>
+          {% endif %} {% for name in existing_sessions %}
+          <div
+            class="p-4 rounded-lg border {% if name in active_sessions %} border-green-500 bg-green-50 {% else %} border-gray-300 bg-gray-50 {% endif %} flex flex-col justify-between"
+          >
+            <div>
+              <span
+                class="font-bold text-gray-800 text-sm block truncate"
+                title="{{ name }}"
+                >{{ name }}</span
+              >
+              <span class="text-xs text-gray-500 block mt-1"
+                >首次进粉累计:
+                <b class="text-blue-600 text-sm">{{ counts.get(name, 0) }}</b>
+                人</span
+              >
+            </div>
+            {% if name in active_sessions %}
+            <div class="mt-4 flex items-center justify-between">
+              <span class="text-xs text-green-600 font-bold flex items-center">
+                <span
+                  class="w-2 h-2 rounded-full bg-green-500 inline-block mr-1.5 animate-pulse"
+                ></span
+                >正在实时监听
+              </span>
+            </div>
+            {% else %}
+            <div class="mt-4">
+              <a
+                href="/activate/{{ name }}"
+                class="block text-center text-xs bg-blue-500 text-white py-1 rounded hover:bg-blue-600 transition font-medium"
+                >离线，点击拉起监听</a
+              >
+            </div>
+            {% endif %}
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div class="bg-white rounded-lg shadow-md overflow-hidden">
+        <div class="px-6 py-4 bg-gray-800 flex justify-between items-center">
+          <h2 class="text-xl font-semibold text-white">
+            📋 SQLite3 捕获真实新进陌生人列表
+          </h2>
+          <button
+            onclick="window.location.reload()"
+            class="bg-blue-500 text-white text-xs px-4 py-1.5 rounded-md font-medium hover:bg-blue-600 transition"
+          >
+            🔄 手动刷新大盘
+          </button>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full text-left border-collapse">
+            <thead>
+              <tr
+                class="bg-gray-100 text-gray-600 uppercase text-xs font-bold leading-normal"
+              >
+                <th class="py-3 px-6 border-b border-gray-200">
+                  所属受控云控号
+                </th>
+                <th class="py-3 px-6 border-b border-gray-200">粉丝昵称</th>
+                <th class="py-3 px-6 border-b border-gray-200">TG 用户 ID</th>
+                <th class="py-3 px-6 border-b border-gray-200">Username</th>
+                <th class="py-3 px-6 border-b border-gray-200">首次捕获时间</th>
+              </tr>
+            </thead>
+            <tbody class="text-gray-600 text-sm font-light">
+              {% for log in logs %}
+              <tr class="border-b border-gray-200 hover:bg-gray-50 transition">
+                <td class="py-3 px-6 font-mono text-xs text-gray-700">
+                  {{ log.session }}
+                </td>
+                <td class="py-3 px-6 font-semibold text-blue-600">
+                  {{ log.full_name }}
+                </td>
+                <td class="py-3 px-6 font-mono text-gray-800">
+                  {{ log.user_id }}
+                </td>
+                <td class="py-3 px-6 font-medium text-green-600">
+                  {{ log.username }}
+                </td>
+                <td class="py-3 px-6 text-gray-500">{{ log.created_at }}</td>
+              </tr>
+              {% endfor %} {% if not logs %}
+              <tr>
+                <td colspan="5" class="py-8 text-center text-sm text-gray-400">
+                  📊 鱼塘还没有动静...
+                </td>
+              </tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      // 异步 Step 1：发送验证码
+      async function sendSmsCode() {
+        const phoneInput = document.getElementById("phone_input");
+        const btn = document.getElementById("send_code_btn");
+        const btnText = document.getElementById("btn_text_1");
+        const tip = document.getElementById("sms_tip_1");
+
+        const phone = phoneInput.value.trim();
+        if (!phone) {
+          alert("请输入手机号！");
+          return;
+        }
+
+        btn.disabled = true;
+        btn.className =
+          "bg-gray-400 text-white px-4 py-2 rounded-lg text-sm font-medium cursor-not-allowed";
+        btnText.innerText = "请求中...";
+        tip.className = "text-xs mt-1 text-gray-500";
+        tip.innerText = "🔄 正在连接 Telegram 下发验证码...";
+        tip.classList.remove("hidden");
+
+        try {
+          const formData = new URLSearchParams();
+          formData.append("phone", phone);
+          const response = await fetch("/login_step1", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: formData,
+          });
+          const resJson = await response.json();
+          if (response.ok) {
+            tip.className = "text-xs mt-1 text-green-600 font-semibold";
+            tip.innerText = `✅ ${resJson.msg}`;
+            btnText.innerText = "下发成功";
+            // 自动同步帮用户填写到第二步输入框中
+            document.getElementById("confirm_phone").value = phone;
+          } else {
+            tip.className = "text-xs mt-1 text-red-500 font-semibold";
+            tip.innerText = `❌ 失败: ${resJson.error}`;
+            resetBtn1(btn, btnText);
+          }
+        } catch (e) {
+          tip.className = "text-xs mt-1 text-red-500";
+          tip.innerText =
+            "🚨 通道抖动，但后端可能已收到请求，请留意手机或直接提交 Step 2。";
+          resetBtn1(btn, btnText);
+        }
+      }
+
+      // 异步 Step 2：提交验证码与二级密码
+      async function submitLoginInfo() {
+        const phone = document.getElementById("confirm_phone").value.trim();
+        const code = document.getElementById("login_code").value.trim();
+        const password = document.getElementById("login_password").value.trim();
+        const btn = document.getElementById("submit_login_btn");
+        const btnText = document.getElementById("btn_text_2");
+        const tip = document.getElementById("sms_tip_2");
+
+        if (!phone || !code) {
+          alert("请确保确认手机号和验证码都已填写！");
+          return;
+        }
+
+        btn.disabled = true;
+        btn.className =
+          "w-full bg-gray-400 text-white py-2 rounded-lg text-sm font-medium cursor-not-allowed";
+        btnText.innerText = "正在向 TG 提交鉴权验证，请稍候...";
+        tip.className = "text-xs mt-1 text-gray-500";
+        tip.innerText = "🔑 正在验证登录权证凭据并安全挂载后台长连接...";
+        tip.classList.remove("hidden");
+
+        try {
+          const formData = new URLSearchParams();
+          formData.append("phone", phone);
+          formData.append("code", code);
+          if (password) formData.append("password", password);
+
+          const response = await fetch("/login_step2", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: formData,
+          });
+          const resJson = await response.json();
+          if (response.ok) {
+            tip.className = "text-xs mt-1 text-green-600 font-bold";
+            tip.innerText = `🎉 恭喜！${resJson.msg} 3秒后自动刷新面板...`;
+            setTimeout(() => {
+              window.location.reload();
+            }, 3000);
+          } else {
+            tip.className = "text-xs mt-1 text-red-500 font-semibold";
+            if (resJson.error === "NEED_PASSWORD") {
+              tip.innerText =
+                "❌ 该号启用了两步验证密码，请输入【两步验证密码】后再点击提交！";
+            } else {
+              tip.innerText = `❌ 失败: ${resJson.error}`;
+            }
+            resetBtn2(btn, btnText);
+          }
+        } catch (e) {
+          tip.className = "text-xs mt-1 text-red-500";
+          tip.innerText = "🚨 校验接口无响应，请查看终端输出是否已经登录成功。";
+          resetBtn2(btn, btnText);
+        }
+      }
+
+      function resetBtn1(btn, btnText) {
+        btn.disabled = false;
+        btn.className =
+          "bg-green-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-green-700 transition";
+        btnText.innerText = "重新获取";
+      }
+      function resetBtn2(btn, btnText) {
+        btn.disabled = false;
+        btn.className =
+          "w-full bg-gray-800 text-white py-2 rounded-lg text-sm font-medium hover:bg-black transition";
+        btnText.innerText = "确认提交并激活常驻监听";
+      }
+    </script>
+  </body>
+</html>

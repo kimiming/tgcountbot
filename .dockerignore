@@ -1,0 +1,8 @@
+sessions/
+data/
+*.db
+.env
+.git
+__pycache__/
+*.pyc
+deploy/
